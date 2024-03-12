@@ -1,148 +1,95 @@
-﻿
+﻿#include <stdio.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
 #include <stdio.h>
 #include <stdlib.h>
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
-const int blocks = 2;
-const int bSize = 20;
-__global__ void addKernel(int *c, const int *a, const int *b)
+// Size of array
+#define N 1048576
+
+// Kernel
+__global__ void add_vectors(double* a, double* b, double* c)
 {
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+	int id = blockDim.x * blockIdx.x + threadIdx.x;
+	if (id < N) c[id] = a[id] + b[id];
 }
 
+// Main program
 int main()
 {
-    const int arraySize = 20;
-    int* a = new int[arraySize];
-    int* b = new int[arraySize];
-    //int a[arraySize];
-    //int b[arraySize];
-    for (int i = 0; i < arraySize; i++) {
-        a[i] = i;
-        b[i] = i;
-    }
-    //const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    //const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, 0);
+	// Number of bytes to allocate for N doubles
+	size_t bytes = N * sizeof(double);
 
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
+	// Allocate memory for arrays A, B, and C on host
+	double* A = (double*)malloc(bytes);
+	double* B = (double*)malloc(bytes);
+	double* C = (double*)malloc(bytes);
 
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop); // Sync events (BLOCKS till last (stop in this case) has been recorded!)
-    float elapsedTime; // Initialize elapsedTime;
-    cudaEventElapsedTime(&elapsedTime, start, stop); // Calculate runtime, write to elapsedTime -- cudaEventElapsedTime returns value in milliseconds. Resolution ~0.5ms
+	// Allocate memory for arrays d_A, d_B, and d_C on device
+	double* d_A, * d_B, * d_C;
+	cudaMalloc(&d_A, bytes);
+	cudaMalloc(&d_B, bytes);
+	cudaMalloc(&d_C, bytes);
 
-     // Print Elapsed time
+	// Fill host arrays A and B
+	for (int i = 0; i < N; i++)
+	{
+		A[i] = 1.0;
+		B[i] = 2.0;
+		
+	}
 
-    // Destroy CUDA Event API Events
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+	// Copy data from host arrays A and B to device arrays d_A and d_B
+	cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_B, B, bytes, cudaMemcpyHostToDevice);
 
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
-    printf("\n");
+	// Set execution configuration parameters
+	//		thr_per_blk: number of CUDA threads per grid block
+	//		blk_in_grid: number of blocks in grid
+	int thr_per_blk = 256;
+	int blk_in_grid = ceil(float(N) / thr_per_blk);
 
-    for (int i = 0; i < arraySize; i++) {
-        printf("c%i = %i\n", i, c[i]);
-    }
-    printf("Execution Time: %f", elapsedTime);
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start, 0);
 
-    return 0;
-}
+	// Launch kernel
+	add_vectors << < blk_in_grid, thr_per_blk >> > (d_A, d_B, d_C);
 
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    printf("size = %i", size);
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
 
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop); // Sync events (BLOCKS till last (stop in this case) has been recorded!)
+	float elapsedTime; // Initialize elapsedTime;
+	cudaEventElapsedTime(&elapsedTime, start, stop);
 
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	// Copy data from device array d_C to host array C
+	cudaMemcpy(C, d_C, bytes, cudaMemcpyDeviceToHost);
 
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	// Verify results
+	double tolerance = 1.0e-14;
+	for (int i = 0; i < N; i++)
+	{
+		//printf("c[%i] = %f\n", i, C[i]);
+	}
+	printf("Execution Time: %f", elapsedTime);
+	// Free CPU memory
+	free(A);
+	free(B);
+	free(C);
 
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	// Free GPU memory
+	cudaFree(d_A);
+	cudaFree(d_B);
+	cudaFree(d_C);
 
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	printf("\n---------------------------\n");
+	printf("__SUCCESS__\n");
+	printf("---------------------------\n");
+	printf("N                 = %d\n", N);
+	printf("Threads Per Block = %d\n", thr_per_blk);
+	printf("Blocks In Grid    = %d\n", blk_in_grid);
+	printf("---------------------------\n\n");
 
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<blocks, bSize,5>>>(dev_c, dev_a, dev_b);
-    
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
+	return 0;
 }
