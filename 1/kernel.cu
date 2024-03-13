@@ -5,7 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 // Size of array
-#define N 1048576
+#define N 104857600
+
+
 
 // Kernel
 __global__ void add_vectors(double* a, double* b, double* c)
@@ -19,7 +21,7 @@ int main()
 {
 	// Number of bytes to allocate for N doubles
 	size_t bytes = N * sizeof(double);
-
+	int thr_per_blk = 32;
 	// Allocate memory for arrays A, B, and C on host
 	double* A = (double*)malloc(bytes);
 	double* B = (double*)malloc(bytes);
@@ -46,8 +48,8 @@ int main()
 	// Set execution configuration parameters
 	//		thr_per_blk: number of CUDA threads per grid block
 	//		blk_in_grid: number of blocks in grid
-	int thr_per_blk = 256;
-	int blk_in_grid = ceil(float(N) / thr_per_blk);
+	
+	int blk_in_grid = ceil(N / thr_per_blk);
 
 	cudaEvent_t start, stop;
 	cudaEventCreate(&start);
@@ -55,7 +57,7 @@ int main()
 	cudaEventRecord(start, 0);
 
 	// Launch kernel
-	add_vectors << < blk_in_grid, thr_per_blk >> > (d_A, d_B, d_C);
+	add_vectors <<< blk_in_grid, thr_per_blk >>> (d_A, d_B, d_C);
 
 
 	cudaEventRecord(stop, 0);
@@ -72,7 +74,7 @@ int main()
 	{
 		//printf("c[%i] = %f\n", i, C[i]);
 	}
-	printf("Execution Time: %f", elapsedTime);
+	printf("Execution Time: %f ms", elapsedTime);
 	// Free CPU memory
 	free(A);
 	free(B);
