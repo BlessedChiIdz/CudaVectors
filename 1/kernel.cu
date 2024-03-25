@@ -1,125 +1,237 @@
-﻿#include <stdio.h>
+﻿
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
 #include <stdio.h>
 #include <stdlib.h>
-#define BLOCK_DIM 1
-__shared__ float temp[BLOCK_DIM][BLOCK_DIM];
+#include <stdio.h>
+#include <assert.h>
 
-__global__ void transposeMatrixFast(float* inputMatrix, float* outputMatrix, int width, int height)
+ // Convenience function for checking CUDA runtime API results
+ // can be wrapped around any runtime API call. No-op in release builds.
+inline
+cudaError_t checkCuda(cudaError_t result)
 {
-	
-
-	int xIndex = blockIdx.x * blockDim.x + threadIdx.x;
-	int yIndex = blockIdx.y * blockDim.y + threadIdx.y;
-
-	if ((xIndex < width) && (yIndex < height))
-	{
-		int idx = yIndex * width + xIndex;
-
-		temp[threadIdx.y][threadIdx.x] = inputMatrix[idx];
-	}
-
-	__syncthreads();
-
-	xIndex = blockIdx.y * blockDim.y + threadIdx.x;
-	yIndex = blockIdx.x * blockDim.x + threadIdx.y;
-
-	if ((xIndex < height) && (yIndex < width))
-	{
-		int idx = yIndex * height + xIndex;
-
-		outputMatrix[idx] = temp[threadIdx.x][threadIdx.y];
-	}
+#if defined(DEBUG) || defined(_DEBUG)
+    if (result != cudaSuccess) {
+        fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+        assert(result == cudaSuccess);
+    }
+#endif
+    return result;
 }
 
-__host__ void printMatrixToFile(char* fileName, float* matrix, int width, int height)
+const int TILE_DIM = 32;
+const int BLOCK_ROWS = 8;
+const int NUM_REPS = 100;
+
+// Check errors and print GB/s
+void postprocess(const float* ref, const float* res, int n, float ms)
 {
-    FILE* file = fopen(fileName, "wt");
-    for (int y = 0; y < height; y++)
-    {
-        for (int x = 0; x < width; x++)
-        {
-            fprintf(file, "%f\t", matrix[y * width + x]);
+    bool passed = true;
+    for (int i = 0; i < n; i++)
+        if (res[i] != ref[i]) {
+            printf("%d %f %f\n", i, res[i], ref[i]);
+            printf("%25s\n", "*** FAILED ***");
+            passed = false;
+            break;
         }
-        fprintf(file, "\n");
-    }
-    fclose(file);
+    if (passed)
+        printf("%20.2f\n", 2 * n * sizeof(float) * 1e-6 * NUM_REPS / ms);
+}
+
+// simple copy kernel
+// Used as reference case representing best effective bandwidth.
+
+// naive transpose
+// Simplest transpose; doesn't use shared memory.
+// Global memory reads are coalesced but writes are not.
+__global__ void transposeNaive(float* odata, const float* idata)
+{
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+    int width = gridDim.x * TILE_DIM;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+        odata[x * width + (y + j)] = idata[(y + j) * width + x];
+}
+
+// coalesced transpose
+// Uses shared memory to achieve coalesing in both reads and writes
+// Tile width == #banks causes shared memory bank conflicts.
+__global__ void transposeCoalesced(float* odata, const float* idata)
+{
+    __shared__ float tile[TILE_DIM][TILE_DIM];
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+    int width = gridDim.x * TILE_DIM;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+        tile[threadIdx.y + j][threadIdx.x] = idata[(y + j) * width + x];
+
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+        odata[(y + j) * width + x] = tile[threadIdx.x][threadIdx.y + j];
 }
 
 
-
-
-int main()
+// No bank-conflict transpose
+// Same as transposeCoalesced except the first tile dimension is padded 
+// to avoid shared memory bank conflicts.
+__global__ void transposeNoBankConflicts(float* odata, const float* idata)
 {
-    int width = 3;   
-    int height = 4;
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
 
-    int matrixSize = width * height;
-    int byteSize = matrixSize * sizeof(float);
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+    int width = gridDim.x * TILE_DIM;
 
-    float* inputMatrix = new float[matrixSize];
-    float* outputMatrix = new float[matrixSize];
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+        tile[threadIdx.y + j][threadIdx.x] = idata[(y + j) * width + x];
 
-    for (int i = 0; i < matrixSize; i++)
-    {
-        inputMatrix[i] = i;
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+        odata[(y + j) * width + x] = tile[threadIdx.x][threadIdx.y + j];
+}
+
+int main(int argc, char** argv)
+{
+    const int nx = 2048;
+    const int ny = 2048;
+    const int mem_size = nx * ny * sizeof(float);
+
+    dim3 dimGrid(nx / TILE_DIM, ny / TILE_DIM, 1);
+    dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
+
+    int devId = 0;
+    if (argc > 1) devId = atoi(argv[1]);
+
+    cudaDeviceProp prop;
+    checkCuda(cudaGetDeviceProperties(&prop, devId));
+    printf("\nDevice : %s\n", prop.name);
+    printf("Matrix size: %d %d, Block size: %d %d, Tile size: %d %d\n",
+        nx, ny, TILE_DIM, BLOCK_ROWS, TILE_DIM, TILE_DIM);
+    printf("dimGrid: %d %d %d. dimBlock: %d %d %d\n",
+        dimGrid.x, dimGrid.y, dimGrid.z, dimBlock.x, dimBlock.y, dimBlock.z);
+
+    checkCuda(cudaSetDevice(devId));
+
+    float* h_idata = (float*)malloc(mem_size);
+    float* h_cdata = (float*)malloc(mem_size);
+    float* h_tdata = (float*)malloc(mem_size);
+    float* gold = (float*)malloc(mem_size);
+
+    float* d_idata, * d_cdata, * d_tdata;
+    checkCuda(cudaMalloc(&d_idata, mem_size));
+    checkCuda(cudaMalloc(&d_cdata, mem_size));
+    checkCuda(cudaMalloc(&d_tdata, mem_size));
+
+    // check parameters and calculate execution configuration
+    if (nx % TILE_DIM || ny % TILE_DIM) {
+        printf("nx and ny must be a multiple of TILE_DIM\n");
+        goto error_exit;
     }
-    int qwe = 0;
-    for (int i = 0; i < height; i++) {
-        for (int j = 0; j < width; j++) {
-            printf("%f ", inputMatrix[qwe]);
-            qwe++;
-        }
-        printf("\n");
+
+    if (TILE_DIM % BLOCK_ROWS) {
+        printf("TILE_DIM must be a multiple of BLOCK_ROWS\n");
+        goto error_exit;
     }
-    
-    
-        float* devInputMatrix;
-        float* devOutputMatrix;
 
-        cudaMalloc((void**)&devInputMatrix, byteSize);
-        cudaMalloc((void**)&devOutputMatrix, byteSize);
+    // host
+    for (int j = 0; j < ny; j++)
+        for (int i = 0; i < nx; i++)
+            h_idata[j * nx + i] = j * nx + i;
 
-        cudaMemcpy(devInputMatrix, inputMatrix, byteSize, cudaMemcpyHostToDevice);
+    // correct result for error checking
+    for (int j = 0; j < ny; j++)
+        for (int i = 0; i < nx; i++)
+            gold[j * nx + i] = h_idata[i * nx + j];
 
-        dim3 gridSize = dim3(width / BLOCK_DIM, height / BLOCK_DIM, 1);
-        dim3 blockSize = dim3(BLOCK_DIM, BLOCK_DIM, 1);
+    // device
+    checkCuda(cudaMemcpy(d_idata, h_idata, mem_size, cudaMemcpyHostToDevice));
 
-        cudaEvent_t start;
-        cudaEvent_t stop;
+    // events for timing
+    cudaEvent_t startEvent, stopEvent;
+    checkCuda(cudaEventCreate(&startEvent));
+    checkCuda(cudaEventCreate(&stopEvent));
+    float ms;
 
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
+    // ------------
+    // time kernels
+    // ------------
+    printf("%25s%25s\n", "Routine", "Bandwidth (GB/s)");
 
-        cudaEventRecord(start, 0);
-
-       
-        
-        transposeMatrixFast << <gridSize, blockSize >> > (devInputMatrix, devOutputMatrix, width, height);
-
-        cudaEventRecord(stop, 0);
-
-        float time = 0;
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&time, start, stop);
-
-        printf("GPU compute time: %.0f\n", time);
-
-        cudaMemcpy(outputMatrix, devOutputMatrix, byteSize, cudaMemcpyDeviceToHost);
-
-        cudaFree(devInputMatrix);
-        cudaFree(devOutputMatrix);
-
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
+    // ----
+    // copy 
+    // ----
     
 
-    printMatrixToFile("after.txt", outputMatrix, height, width);
+    // --------------
+    // transposeNaive 
+    // --------------
+    printf("%25s", "naive transpose");
+    checkCuda(cudaMemset(d_tdata, 0, mem_size));
+    // warmup
+    transposeNaive << <dimGrid, dimBlock >> > (d_tdata, d_idata);
+    checkCuda(cudaEventRecord(startEvent, 0));
+    for (int i = 0; i < NUM_REPS; i++)
+        transposeNaive << <dimGrid, dimBlock >> > (d_tdata, d_idata);
+    checkCuda(cudaEventRecord(stopEvent, 0));
+    checkCuda(cudaEventSynchronize(stopEvent));
+    checkCuda(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    checkCuda(cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost));
+    postprocess(gold, h_tdata, nx * ny, ms);
 
-    delete[] inputMatrix;
-    delete[] outputMatrix;
+    // ------------------
+    // transposeCoalesced 
+    // ------------------
+    printf("%25s", "coalesced transpose");
+    checkCuda(cudaMemset(d_tdata, 0, mem_size));
+    // warmup
+    transposeCoalesced << <dimGrid, dimBlock >> > (d_tdata, d_idata);
+    checkCuda(cudaEventRecord(startEvent, 0));
+    for (int i = 0; i < NUM_REPS; i++)
+        transposeCoalesced << <dimGrid, dimBlock >> > (d_tdata, d_idata);
+    checkCuda(cudaEventRecord(stopEvent, 0));
+    checkCuda(cudaEventSynchronize(stopEvent));
+    checkCuda(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    checkCuda(cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost));
+    postprocess(gold, h_tdata, nx * ny, ms);
 
-    return 0;
+    // ------------------------
+    // transposeNoBankConflicts
+    // ------------------------
+    printf("%25s", "conflict-free transpose");
+    checkCuda(cudaMemset(d_tdata, 0, mem_size));
+    // warmup
+    transposeNoBankConflicts << <dimGrid, dimBlock >> > (d_tdata, d_idata);
+    checkCuda(cudaEventRecord(startEvent, 0));
+    for (int i = 0; i < NUM_REPS; i++)
+        transposeNoBankConflicts << <dimGrid, dimBlock >> > (d_tdata, d_idata);
+    checkCuda(cudaEventRecord(stopEvent, 0));
+    checkCuda(cudaEventSynchronize(stopEvent));
+    checkCuda(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    checkCuda(cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost));
+    postprocess(gold, h_tdata, nx * ny, ms);
+
+error_exit:
+    // cleanup
+    checkCuda(cudaEventDestroy(startEvent));
+    checkCuda(cudaEventDestroy(stopEvent));
+    checkCuda(cudaFree(d_tdata));
+    checkCuda(cudaFree(d_cdata));
+    checkCuda(cudaFree(d_idata));
+    free(h_idata);
+    free(h_tdata);
+    free(h_cdata);
+    free(gold);
 }
