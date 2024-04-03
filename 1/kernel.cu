@@ -170,9 +170,6 @@ int main(int argc, char** argv)
     // ------------
     printf("%25s%25s\n", "Routine", "Bandwidth (GB/s)");
 
-    // ----
-    // copy 
-    // ----
     
 
     // --------------
@@ -184,7 +181,7 @@ int main(int argc, char** argv)
     transposeNaive << <dimGrid, dimBlock >> > (d_tdata, d_idata);
     checkCuda(cudaEventRecord(startEvent, 0));
     for (int i = 0; i < NUM_REPS; i++)
-        transposeNaive << <dimGrid, dimBlock >> > (d_tdata, d_idata);
+    transposeNaive << <dimGrid, dimBlock >> > (d_tdata, d_idata);
     checkCuda(cudaEventRecord(stopEvent, 0));
     checkCuda(cudaEventSynchronize(stopEvent));
     checkCuda(cudaEventElapsedTime(&ms, startEvent, stopEvent));
